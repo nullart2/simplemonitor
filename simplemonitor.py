@@ -6,8 +6,32 @@ import copy
 import pickle
 import time
 import logging
+from socket import gethostname
 
-import Loggers
+import Loggers.db
+import Loggers.file
+import Loggers.network
+
+import Alerters.bulksms
+import Alerters.execute
+import Alerters.fortysixelks
+import Alerters.mail
+import Alerters.nma
+import Alerters.pushbullet
+import Alerters.pushover
+import Alerters.ses
+import Alerters.slack
+import Alerters.syslogger
+
+import Monitors.monitor
+import Monitors.network
+import Monitors.service
+import Monitors.host
+import Monitors.file
+import Monitors.compound
+
+from envconfig import EnvironmentAwareConfigParser
+from util import get_config_dict
 
 module_logger = logging.getLogger('simplemonitor')
 
@@ -214,3 +238,192 @@ class SimpleMonitor:
         for monitor in list(data.keys()):
             module_logger.info("trying remote monitor %s", monitor)
             self.remote_monitors[monitor] = pickle.loads(data[monitor])
+
+    def load_monitors(self, filename):
+        """Load all the monitors from the config file and return a populated SimpleMonitor."""
+        config = EnvironmentAwareConfigParser()
+        config.read(filename)
+        monitors = config.sections()
+        if "defaults" in monitors:
+            default_config = get_config_dict(config, "defaults")
+            monitors.remove("defaults")
+        else:
+            default_config = {}
+
+        myhostname = gethostname().lower()
+
+        module_logger.info('=== Loading monitors')
+        for monitor in monitors:
+            if config.has_option(monitor, "runon"):
+                if myhostname != config.get(monitor, "runon").lower():
+                    module_logger.warning("Ignoring monitor %s because it's only for host %s", monitor, config.get(monitor, "runon"))
+                    continue
+            monitor_type = config.get(monitor, "type")
+            new_monitor = None
+            config_options = default_config.copy()
+            config_options.update(get_config_dict(config, monitor))
+
+            if monitor_type == "host":
+                new_monitor = Monitors.network.MonitorHost(monitor, config_options)
+
+            elif monitor_type == "service":
+                new_monitor = Monitors.service.MonitorService(monitor, config_options)
+
+            elif monitor_type == "tcp":
+                new_monitor = Monitors.network.MonitorTCP(monitor, config_options)
+
+            elif monitor_type == "rc":
+                new_monitor = Monitors.service.MonitorRC(monitor, config_options)
+
+            elif monitor_type == "diskspace":
+                new_monitor = Monitors.host.MonitorDiskSpace(monitor, config_options)
+
+            elif monitor_type == "http":
+                new_monitor = Monitors.network.MonitorHTTP(monitor, config_options)
+
+            elif monitor_type == "apcupsd":
+                new_monitor = Monitors.host.MonitorApcupsd(monitor, config_options)
+
+            elif monitor_type == "svc":
+                new_monitor = Monitors.service.MonitorSvc(monitor, config_options)
+
+            elif monitor_type == "backup":
+                new_monitor = Monitors.file.MonitorBackup(monitor, config_options)
+
+            elif monitor_type == "portaudit":
+                new_monitor = Monitors.host.MonitorPortAudit(monitor, config_options)
+
+            elif monitor_type == "pkgaudit":
+                new_monitor = Monitors.host.MonitorPkgAudit(monitor, config_options)
+
+            elif monitor_type == "loadavg":
+                new_monitor = Monitors.host.MonitorLoadAvg(monitor, config_options)
+
+            elif monitor_type == "eximqueue":
+                new_monitor = Monitors.service.MonitorEximQueue(monitor, config_options)
+
+            elif monitor_type == "windowsdhcp":
+                new_monitor = Monitors.service.MonitorWindowsDHCPScope(monitor, config_options)
+
+            elif monitor_type == "zap":
+                new_monitor = Monitors.host.MonitorZap(monitor, config_options)
+
+            elif monitor_type == "fail":
+                new_monitor = Monitors.monitor.MonitorFail(monitor, config_options)
+
+            elif monitor_type == "null":
+                new_monitor = Monitors.monitor.MonitorNull(monitor, config_options)
+
+            elif monitor_type == "filestat":
+                new_monitor = Monitors.host.MonitorFileStat(monitor, config_options)
+
+            elif monitor_type == "compound":
+                new_monitor = Monitors.compound.CompoundMonitor(monitor, config_options)
+                new_monitor.set_mon_refs(self)
+
+            elif monitor_type == 'dns':
+                new_monitor = Monitors.network.MonitorDNS(monitor, config_options)
+
+            elif monitor_type == 'command':
+                new_monitor = Monitors.host.MonitorCommand(monitor, config_options)
+
+            else:
+                module_logger.error("Unknown type %s for monitor %s", monitor_type, monitor)
+                continue
+            if new_monitor is None:
+                continue
+
+            module_logger.info("Adding %s monitor %s: %s", monitor_type, monitor, new_monitor)
+            self.add_monitor(monitor, new_monitor)
+
+        for i in list(self.monitors.keys()):
+            self.monitors[i].post_config_setup()
+        module_logger.info('--- Loaded %d monitors', self.count_monitors())
+
+    def load_loggers(self, config):
+        """Load the loggers listed in the config object."""
+
+        if config.has_option("reporting", "loggers"):
+            loggers = config.get("reporting", "loggers").split(",")
+        else:
+            loggers = []
+
+        module_logger.info('=== Loading loggers')
+        for config_logger in loggers:
+            logger_type = config.get(config_logger, "type")
+            config_options = get_config_dict(config, config_logger)
+            config_options['_name'] = config_logger
+            if logger_type == "db":
+                new_logger = Loggers.db.DBFullLogger(config_options)
+            elif logger_type == "dbstatus":
+                new_logger = Loggers.db.DBStatusLogger(config_options)
+            elif logger_type == "logfile":
+                new_logger = Loggers.file.FileLogger(config_options)
+            elif logger_type == "html":
+                new_logger = Loggers.file.HTMLLogger(config_options)
+            elif logger_type == "network":
+                new_logger = Loggers.network.NetworkLogger(config_options)
+            elif logger_type == "json":
+                new_logger = Loggers.file.JsonLogger(config_options)
+            else:
+                module_logger.error("Unknown logger logger_type %s", logger_type)
+                continue
+            if new_logger is None:
+                module_logger.error("Creating logger %s failed!", new_logger)
+                continue
+            module_logger.info("Adding %s logger %s: %s", logger_type, config_logger, new_logger)
+            self.add_logger(config_logger, new_logger)
+            del new_logger
+        module_logger.info('--- Loaded %d loggers', len(self.loggers))
+
+    def load_alerters(monitor_instance, config):
+        """Load the alerters listed in the config object."""
+        if config.has_option("reporting", "alerters"):
+            alerters = config.get("reporting", "alerters").split(",")
+        else:
+            alerters = []
+
+        module_logger.info('=== Loading alerters')
+        for alerter in alerters:
+            alerter_type = config.get(alerter, "type")
+            config_options = get_config_dict(config, alerter)
+            if alerter_type == "email":
+                new_alerter = Alerters.mail.EMailAlerter(config_options)
+            elif alerter_type == "ses":
+                new_alerter = Alerters.ses.SESAlerter(config_options)
+            elif alerter_type == "bulksms":
+                new_alerter = Alerters.bulksms.BulkSMSAlerter(config_options)
+            elif alerter_type == "46elks":
+                new_alerter = Alerters.fortysixelks.FortySixElksAlerter(config_options)
+            elif alerter_type == "syslog":
+                new_alerter = Alerters.syslogger.SyslogAlerter(config_options)
+            elif alerter_type == "execute":
+                new_alerter = Alerters.execute.ExecuteAlerter(config_options)
+            elif alerter_type == "slack":
+                new_alerter = Alerters.slack.SlackAlerter(config_options)
+            elif alerter_type == "pushover":
+                new_alerter = Alerters.pushover.PushoverAlerter(config_options)
+            elif alerter_type == "nma":
+                new_alerter = Alerters.nma.NMAAlerter(config_options)
+            elif alerter_type == "pushbullet":
+                new_alerter = Alerters.pushbullet.PushbulletAlerter(config_options)
+            else:
+                module_logger.error("Unknown alerter type %s", alerter_type)
+                continue
+            module_logger.info("Adding %s alerter %s", alerter_type, alerter)
+            new_alerter.name = alerter
+            monitor_instance.add_alerter(alerter, new_alerter)
+            del new_alerter
+        module_logger.info('--- Loaded %d alerters', len(monitor_instance.alerters))
+
+    def run_loop(self):
+        """Run the complete monitor loop once."""
+        module_logger.debug('Running tests')
+        self.run_tests()
+        module_logger.debug('Running recovery')
+        self.do_recovery()
+        module_logger.debug('Running alerts')
+        self.do_alerts()
+        module_logger.debug('Running logs')
+        self.do_logs()
+        module_logger.debug('Loop complete')
